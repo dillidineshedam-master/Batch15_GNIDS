@@ -1,0 +1,50 @@
+system:
+  project_name: "Fed-GNIDS"
+  seed: 42
+  device: "cpu"
+
+data:
+  raw_file: "data/unsw_nb15_benchmark.csv"
+  num_nodes: 50
+  window_size_seconds: 600
+  max_snapshots: 10
+  dirichlet_alpha: 0.5
+  features:
+    - dur
+    - spkts
+    - dpkts
+    - sbytes
+    - dbytes
+    - rate
+    - sttl
+    - dttl
+    - sload
+    - dload
+    - sloss
+    - dloss
+    - sinpkt
+    - dinpkt
+    - sjit
+    - djit
+
+model:
+  in_dim: 16
+  hidden_dim: 32
+  heads: 2
+  sequence_length: 8
+  learning_rate: 0.005
+  weight_decay: 0.00001
+  local_epochs: 3
+
+federated:
+  server_address: "0.0.0.0:8080"
+  num_rounds: 15
+  min_fit_clients: 2
+  min_eval_clients: 2
+  fraction_fit: 1.0
+  dp_enabled: true
+  dp_clip_norm: 1.0
+  dp_noise_multiplier: 0.01
+
+detection:
+  threshold_sigma_multiplier: 1.25

@@ -1,0 +1,5 @@
+Model,Accuracy (%),Precision,Recall,F1-Score,ROC-AUC
+Centralized Random Forest (Tabular),94.66,0.9523,0.9701,0.9611,0.9871
+Spatial GCN (Non-Temporal),48.0,0.0769,0.0667,0.0714,0.2267
+Local-Only GAT-GRU (No FL),92.0,1.0,0.7333,0.8462,0.9981
+Fed-GAT-GRU (Proposed),100.0,1.0,1.0,1.0,1.0
