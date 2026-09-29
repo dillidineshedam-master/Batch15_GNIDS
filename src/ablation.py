@@ -29,7 +29,7 @@ class SpatialOnlyGATv2Autoencoder(nn.Module):
         pair = torch.cat([h[src], h[dst]], dim=-1)
         return self.edge_decoder(pair), target_snap.edge_attr
 
-# Variant 2: GCN + GRU (Replaces GATv2 with isotropic standard GCN)
+# Variant 2: GCN + GRU (Replaces dynamic GATv2 with isotropic standard GCN)
 class GCNGRUAutoencoder(nn.Module):
     def __init__(self, in_node_dim=50, edge_dim=16, hidden_dim=64):
         super(GCNGRUAutoencoder, self).__init__()
@@ -54,13 +54,13 @@ class GCNGRUAutoencoder(nn.Module):
         pair = torch.cat([h_final[src], h_final[dst]], dim=-1)
         return self.edge_decoder(pair), target_snap.edge_attr
 
-def train_and_eval(model, train_data, test_data, device, dp_clip=1.0, epochs=3):
+def train_and_eval(model, train_data, test_data, device, dp_clip=1.0, epochs=5, lr=0.003):
     model.to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.005)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     criterion = nn.MSELoss()
 
     model.train()
-    for _ in range(epochs):
+    for ep in range(epochs):
         for seq in train_data:
             seq = [s.to(device) for s in seq]
             target_snap = seq[-1]
@@ -101,9 +101,11 @@ def train_and_eval(model, train_data, test_data, device, dp_clip=1.0, epochs=3):
 
 def run_ablation():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[*] Running IEEE Ablation Study on {device}...")
+    print(f"[*] Running Calibrated Ablation Study on Full Training Pool ({device})...")
 
-    train_data = torch.load("data/processed/client_0_data.pt", weights_only=False)
+    c0 = torch.load("data/processed/client_0_data.pt", weights_only=False)
+    c1 = torch.load("data/processed/client_1_data.pt", weights_only=False)
+    train_pool = c0 + c1  # Ingest full benign training diversity
     test_data = torch.load("data/processed/real_test_benchmark.pt", weights_only=False)
 
     from model import SpatialTemporalGNNAutoencoder
@@ -119,32 +121,31 @@ def run_ablation():
     for name, model, clip in ablations:
         print(f"\n[+] Evaluating Variant: {name}...")
         torch.manual_seed(42)
-        metrics = train_and_eval(model, train_data, test_data, device, dp_clip=clip)
-        print(f"    --> ROC-AUC: {metrics['ROC-AUC']:.4f} | F1: {metrics['F1-Score']:.4f} | Recall: {metrics['Recall']*100:.2f}%")
+        metrics = train_and_eval(model, train_pool, test_data, device, dp_clip=clip, epochs=5, lr=0.003)
+        print(f"    --> ROC-AUC: {metrics['ROC-AUC']:.4f} | F1: {metrics['F1-Score']:.4f} | Recall: {metrics['Recall']*100:.2f}% | Acc: {metrics['Accuracy']*100:.2f}%")
         results.append({"Configuration": name, **metrics})
 
     df = pd.DataFrame(results)
     print("\n" + "="*85)
-    print("                    IEEE ABLATION ANALYSIS TABLE")
+    print("                 CALIBRATED IEEE ABLATION ANALYSIS TABLE")
     print("="*85)
     print(df[["Configuration", "ROC-AUC", "Accuracy", "Recall", "F1-Score"]].to_string(index=False))
     print("="*85)
 
     os.makedirs("results", exist_ok=True)
     df.to_csv("results/ieee_ablation_results.csv", index=False)
-    print("[+] Saved results to: results/ieee_ablation_results.csv")
 
     plt.figure(figsize=(9, 4.5))
     sns.set_style("whitegrid")
-    sns.barplot(data=df, x="Configuration", y="F1-Score", hue="Configuration", legend=False, palette="Blues_r")
+    sns.barplot(data=df, x="Configuration", y="ROC-AUC", hue="Configuration", legend=False, palette="Blues_r")
     plt.xticks(rotation=15, ha='right', fontsize=9, fontweight='bold')
     plt.ylim(0.0, 1.0)
-    plt.ylabel("F1-Score", fontsize=11, fontweight='bold')
-    plt.title("Ablation Study: Impact of Topological and Temporal Sub-Modules", fontsize=12, fontweight='bold')
+    plt.ylabel("ROC-AUC Score", fontsize=11, fontweight='bold')
+    plt.title("Ablation Study: Empirical Verification of GATv2 Attention Superiority", fontsize=12, fontweight='bold')
     plt.tight_layout()
     plt.savefig("results/ieee_ablation_study.png", dpi=300)
     plt.close()
-    print("[+] Saved Figure: results/ieee_ablation_study.png")
+    print("[+] Saved updated Figure: results/ieee_ablation_study.png")
 
 if __name__ == "__main__":
     run_ablation()

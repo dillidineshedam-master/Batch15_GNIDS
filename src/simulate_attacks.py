@@ -7,185 +7,172 @@ import seaborn as sns
 import torch
 import torch.nn as nn
 from sklearn.metrics import roc_auc_score, accuracy_score, precision_score, recall_score, f1_score
-
 from model import SpatialTemporalGNNAutoencoder
 
-def train_local_epoch(model, dataset, optimizer, criterion, device, dp_clip=1.0):
+def train_client_local(model, data_slice, device, epochs=3, lr=0.005, dp_clip=1.0):
     model.train()
-    total_loss = 0.0
-    count = 0
-    for seq in dataset:
-        seq = [snap.to(device) for snap in seq]
-        target_snap = seq[-1]
-        benign_mask = (target_snap.y == 0)
-        if benign_mask.sum() == 0:
-            continue
-        optimizer.zero_grad()
-        pred, target = model(seq)
-        loss = criterion(pred[benign_mask], target[benign_mask])
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=dp_clip)
-        optimizer.step()
-        total_loss += loss.item()
-        count += 1
-    return total_loss / max(1, count)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    criterion = nn.MSELoss()
+    
+    for _ in range(epochs):
+        for seq in data_slice:
+            seq = [s.to(device) for s in seq]
+            mask = (seq[-1].y == 0)
+            if mask.sum() == 0:
+                continue
+            optimizer.zero_grad()
+            rec, gt = model(seq)
+            loss = criterion(rec[mask], gt[mask])
+            loss.backward()
+            if dp_clip is not None:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=dp_clip)
+            optimizer.step()
+            
+    return model.state_dict()
 
-def evaluate_model(model, test_dataset, device):
+def evaluate_model(model, test_data, device):
     model.eval()
-    all_scores, all_labels = [], []
+    scores, labels = [], []
     with torch.no_grad():
-        for seq in test_dataset:
-            seq = [snap.to(device) for snap in seq]
-            target_snap = seq[-1]
+        for seq in test_data:
+            seq = [s.to(device) for s in seq]
             rec, gt = model(seq)
             mse = torch.mean((rec - gt) ** 2, dim=-1)
-            all_scores.extend(mse.cpu().numpy())
-            all_labels.extend(target_snap.y.cpu().numpy())
+            scores.extend(mse.cpu().numpy())
+            labels.extend(seq[-1].y.cpu().numpy())
             
-    all_scores = np.array(all_scores)
-    all_labels = np.array(all_labels)
+    scores = np.array(scores)
+    labels = np.array(labels)
+    auc = roc_auc_score(labels, scores)
+    tau = np.mean(scores[labels == 0]) + 2.0 * np.std(scores[labels == 0])
+    preds = (scores >= tau).astype(int)
+    
+    return {
+        "ROC-AUC": auc,
+        "Accuracy": accuracy_score(labels, preds),
+        "Precision": precision_score(labels, preds, zero_division=0),
+        "Recall": recall_score(labels, preds, zero_division=0),
+        "F1-Score": f1_score(labels, preds, zero_division=0)
+    }
 
-    roc_auc = roc_auc_score(all_labels, all_scores)
-    normal_scores = all_scores[all_labels == 0]
-    tau = np.mean(normal_scores) + 2.0 * np.std(normal_scores)
-    preds = (all_scores >= tau).astype(int)
+def aggregate_fedavg(global_state, client_states):
+    new_state = copy.deepcopy(global_state)
+    for key in new_state.keys():
+        stacked = torch.stack([cs[key].float() for cs in client_states], dim=0)
+        new_state[key] = torch.mean(stacked, dim=0).to(new_state[key].dtype)
+    return new_state
 
-    acc = accuracy_score(all_labels, preds)
-    prec = precision_score(all_labels, preds, zero_division=0)
-    rec = recall_score(all_labels, preds, zero_division=0)
-    f1 = f1_score(all_labels, preds, zero_division=0)
-    return roc_auc, acc, prec, rec, f1
+def aggregate_acs(global_state, client_states, clip_norm=5.0):
+    new_state = copy.deepcopy(global_state)
+    deltas = []
+    flattened_deltas = []
 
-def aggregate_fedavg(global_weights, client_deltas):
-    avg_delta = [np.mean([cd[i] for cd in client_deltas], axis=0) for i in range(len(global_weights))]
-    return [gw + ad for gw, ad in zip(global_weights, avg_delta)]
+    for cs in client_states:
+        delta = {k: cs[k].float() - global_state[k].float() for k in cs.keys()}
+        deltas.append(delta)
+        flat = torch.cat([d.flatten() for d in delta.values()])
+        flattened_deltas.append(flat)
 
-def aggregate_acs(global_weights, client_deltas, norm_threshold=5.0):
-    flat_deltas = [np.concatenate([d.flatten() for d in cd]) for cd in client_deltas]
-    median_ref = np.median(flat_deltas, axis=0)
-    ref_norm = np.linalg.norm(median_ref) + 1e-8
+    stacked_flats = torch.stack(flattened_deltas, dim=0)
+    median_ref = torch.median(stacked_flats, dim=0).values
+    median_norm = torch.norm(median_ref) + 1e-7
 
     weights = []
-    for f_delta in flat_deltas:
-        l2_norm = np.linalg.norm(f_delta)
-        norm_factor = min(1.0, norm_threshold / (l2_norm + 1e-8))
-        cosine_sim = np.dot(f_delta, median_ref) / ((l2_norm * ref_norm) + 1e-8)
-        alignment_factor = max(0.0, float(cosine_sim))
-        weights.append(alignment_factor * norm_factor)
+    for flat in flattened_deltas:
+        u_norm = torch.norm(flat) + 1e-7
+        beta = min(1.0, float(clip_norm / u_norm))
+        cos_sim = float(torch.dot(flat, median_ref) / (u_norm * median_norm))
+        gamma = max(0.0, cos_sim)
+        weights.append(beta * gamma)
 
-    sum_w = sum(weights) + 1e-8
-    norm_weights = [w / sum_w for w in weights]
+    total_w = sum(weights) + 1e-7
+    norm_weights = [w / total_w for w in weights]
 
-    aggregated_delta = [np.zeros_like(gw) for gw in global_weights]
-    for client_idx, w in enumerate(norm_weights):
-        for layer_idx, layer_delta in enumerate(client_deltas[client_idx]):
-            aggregated_delta[layer_idx] += w * layer_delta
+    for key in new_state.keys():
+        weighted_delta = sum(norm_weights[i] * deltas[i][key] for i in range(len(client_states)))
+        new_state[key] = (global_state[key].float() + weighted_delta).to(new_state[key].dtype)
 
-    return [gw + ad for gw, ad in zip(global_weights, aggregated_delta)]
+    return new_state
 
-def run_adversarial_simulation():
+def run_byzantine_benchmark(num_clients=8, num_byzantine=2, rounds=4):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[*] Running Byzantine Poisoning Benchmark (K=4 clients, f=25% Adversary) on {device}...")
+    print(f"[*] Running Scaled Byzantine Benchmark (K={num_clients} clients, f={num_byzantine/num_clients*100:.0f}% Adversaries) on {device}...")
 
-    # Load partitions and create 4 subnets
     c0 = torch.load("data/processed/client_0_data.pt", weights_only=False)
     c1 = torch.load("data/processed/client_1_data.pt", weights_only=False)
+    pool = c0 + c1
     test_data = torch.load("data/processed/real_test_benchmark.pt", weights_only=False)
 
-    # Split into 4 distinct non-IID client subnets
-    half_c1 = len(c1) // 3
-    client_pools = [
-        c0,                      # Client 0 (Honest)
-        c1[:half_c1],            # Client 1 (Honest)
-        c1[half_c1: 2*half_c1],  # Client 2 (Honest)
-        c1[2*half_c1:]           # Client 3 (Adversary: Byzantine Subnet)
-    ]
+    # Partition across K=8 subnets
+    chunk_size = len(pool) // num_clients
+    subnets = [pool[i * chunk_size:(i + 1) * chunk_size] for i in range(num_clients)]
 
     scenarios = [
         ("Clean Baseline (No Attack)", "fedavg", "none"),
         ("FedAvg under Sign-Flip Attack", "fedavg", "sign_flip"),
-        ("FedAvg under Scale-Poisoning (20x)", "fedavg", "scale_poison"),
+        ("FedAvg under Scale-Poisoning (20x)", "fedavg", "scale_20x"),
         ("ACS under Sign-Flip Attack (Proposed)", "acs", "sign_flip"),
-        ("ACS under Scale-Poisoning (Proposed)", "acs", "scale_poison"),
+        ("ACS under Scale-Poisoning (Proposed)", "acs", "scale_20x"),
     ]
 
     results = []
 
-    for name, strategy, attack_type in scenarios:
+    for name, agg_mode, attack_mode in scenarios:
         print(f"\n[+] Testing Scenario: {name}...")
         torch.manual_seed(42)
-        global_model = SpatialTemporalGNNAutoencoder(in_node_dim=50, edge_dim=16, hidden_dim=64).to(device)
-        global_weights = [val.cpu().numpy() for _, val in global_model.state_dict().items()]
-        criterion = nn.MSELoss()
+        global_model = SpatialTemporalGNNAutoencoder(50, 16, 64).to(device)
 
-        for r in range(1, 4):
-            client_deltas = []
-            for c_id, pool in enumerate(client_pools):
-                c_model = copy.deepcopy(global_model)
-                opt = torch.optim.Adam(c_model.parameters(), lr=0.005)
-                train_local_epoch(c_model, pool, opt, criterion, device)
-                c_weights = [val.cpu().numpy() for _, val in c_model.state_dict().items()]
-                delta = [cw - gw for cw, gw in zip(c_weights, global_weights)]
+        for rnd in range(rounds):
+            client_states = []
+            for k in range(num_clients):
+                local_m = copy.deepcopy(global_model)
+                local_state = train_client_local(local_m, subnets[k], device, epochs=2)
 
-                # Client 3 is the compromised Byzantine node
-                if c_id == 3:
-                    if attack_type == "sign_flip":
-                        delta = [-1.0 * d for d in delta]
-                    elif attack_type == "scale_poison":
-                        delta = [20.0 * d for d in delta]
+                # First num_byzantine clients are Byzantine adversaries
+                if k < num_byzantine and attack_mode != "none":
+                    corrupted = copy.deepcopy(local_state)
+                    for key in corrupted.keys():
+                        delta = local_state[key].float() - global_model.state_dict()[key].float()
+                        if attack_mode == "sign_flip":
+                            corrupted[key] = (global_model.state_dict()[key].float() - delta).to(corrupted[key].dtype)
+                        elif attack_mode == "scale_20x":
+                            corrupted[key] = (global_model.state_dict()[key].float() + 20.0 * delta).to(corrupted[key].dtype)
+                    client_states.append(corrupted)
+                else:
+                    client_states.append(local_state)
 
-                client_deltas.append(delta)
-
-            if strategy == "fedavg":
-                global_weights = aggregate_fedavg(global_weights, client_deltas)
+            if agg_mode == "fedavg":
+                new_state = aggregate_fedavg(global_model.state_dict(), client_states)
             else:
-                global_weights = aggregate_acs(global_weights, client_deltas, norm_threshold=5.0)
+                new_state = aggregate_acs(global_model.state_dict(), client_states)
 
-            params_dict = zip(global_model.state_dict().keys(), [torch.tensor(w) for w in global_weights])
-            global_model.load_state_dict({k: v for k, v in params_dict})
+            global_model.load_state_dict(new_state)
 
-        auc, acc, prec, rec, f1 = evaluate_model(global_model, test_data, device)
-        print(f"    --> Results: ROC-AUC={auc:.4f} | Accuracy={acc*100:.2f}% | Precision={prec:.4f} | Recall={rec*100:.2f}% | F1={f1:.4f}")
-        results.append({
-            "Defense Strategy & Attack Scenario": name,
-            "Strategy": strategy.upper(),
-            "Attack Type": attack_type,
-            "ROC-AUC": auc,
-            "Accuracy": acc,
-            "Precision": prec,
-            "Recall": rec,
-            "F1-Score": f1
-        })
+        metrics = evaluate_model(global_model, test_data, device)
+        print(f"    --> Results: ROC-AUC={metrics['ROC-AUC']:.4f} | Accuracy={metrics['Accuracy']*100:.2f}% | Precision={metrics['Precision']:.4f} | Recall={metrics['Recall']*100:.2f}% | F1={metrics['F1-Score']:.4f}")
+        results.append({"Defense Strategy & Attack Scenario": name, **metrics})
 
-    df_results = pd.DataFrame(results)
+    df = pd.DataFrame(results)
     print("\n" + "="*90)
-    print("      IEEE ADVERSARIAL POISONING ROBUSTNESS BENCHMARK TABLE (K=4, f=25%)")
+    print(f"      IEEE ADVERSARIAL POISONING ROBUSTNESS BENCHMARK TABLE (K={num_clients}, f={num_byzantine/num_clients*100:.0f}%)")
     print("="*90)
-    print(df_results[["Defense Strategy & Attack Scenario", "ROC-AUC", "Accuracy", "Recall", "F1-Score"]].to_string(index=False))
+    print(df[["Defense Strategy & Attack Scenario", "ROC-AUC", "Accuracy", "Recall", "F1-Score"]].to_string(index=False))
     print("="*90)
 
     os.makedirs("results", exist_ok=True)
-    df_results.to_csv("results/adversarial_robustness_benchmark.csv", index=False)
+    df.to_csv("results/adversarial_robustness_benchmark.csv", index=False)
 
-    plt.figure(figsize=(9, 5))
+    plt.figure(figsize=(10, 5))
     sns.set_style("whitegrid")
-    sns.barplot(
-        data=df_results,
-        x="Defense Strategy & Attack Scenario",
-        y="ROC-AUC",
-        hue="Defense Strategy & Attack Scenario",
-        legend=False,
-        palette=["#2ca02c", "#d62728", "#d62728", "#1f77b4", "#1f77b4"]
-    )
+    sns.barplot(data=df, x="Defense Strategy & Attack Scenario", y="Accuracy", hue="Defense Strategy & Attack Scenario", legend=False, palette="Set1")
     plt.xticks(rotation=20, ha='right', fontsize=9, fontweight='bold')
-    plt.ylim(0.0, 1.05)
-    plt.ylabel("ROC-AUC Score", fontsize=11, fontweight='bold')
-    plt.title("Byzantine Poisoning Robustness: FedAvg Collapse vs. ACS Resilience (f=25%)", fontsize=12, fontweight='bold')
-    plt.axhline(0.5, color='gray', linestyle='--', label='Random Guess Baseline')
+    plt.ylim(0.0, 1.0)
+    plt.ylabel("Detection Accuracy", fontsize=11, fontweight='bold')
+    plt.title(f"Byzantine Defense Scalability: FedAvg vs ACS (K={num_clients} Clients, f=25% Adversaries)", fontsize=12, fontweight='bold')
     plt.tight_layout()
     plt.savefig("results/ieee_adversarial_robustness.png", dpi=300)
     plt.close()
     print("[+] Updated IEEE Publication Figure: results/ieee_adversarial_robustness.png")
 
 if __name__ == "__main__":
-    run_adversarial_simulation()
+    run_byzantine_benchmark(num_clients=8, num_byzantine=2, rounds=4)
