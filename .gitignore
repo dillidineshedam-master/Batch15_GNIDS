@@ -1,14 +1,5 @@
-# Python & Virtual Environments
-env/
+﻿env/
 venv/
 __pycache__/
 *.pyc
-
-# Raw Data Files (keeps processed tensors, ignores large CSVs)
-data/raw/*.csv
-data/raw/*.zip
-data/raw/*.pcap
-
-# Temp and OS files
-*.tmp
-.DS_Store
+.vscode/

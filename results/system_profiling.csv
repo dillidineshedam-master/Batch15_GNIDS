@@ -1,2 +1,2 @@
 Total Parameters,Model Size (KB),Payload per Round (KB),Avg Window Latency (ms),95th Pct Latency (ms),Throughput (flows/sec)
-68848,268.94,268.94,51.83,96.02,4823.0
+68848,268.94,268.94,72.03,151.04,3471.0
