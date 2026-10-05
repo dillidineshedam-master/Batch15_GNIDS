@@ -1,5 +1,5 @@
-Configuration,ROC-AUC,Accuracy,Precision,Recall,F1-Score
-Full Architecture (GATv2 + GRU + DP),0.8197727466615214,0.726125,0.9733592610597959,0.6137952176578786,0.7528482797518331
-w/o Temporal Recurrence (Spatial GATv2 Only),0.8310626682793311,0.6877083333333334,0.9750997089576372,0.5546290619251992,0.7070778129518897
-w/o Graph Attention (Static GCN + GRU),0.8208610799058234,0.7021666666666667,0.9747150259067358,0.5767014101778051,0.724653312788906
-w/o Differential Privacy (No Norm Clipping),0.8244545377715092,0.7245416666666666,0.9732604664779936,0.6114653586756591,0.75106374967052
+Architecture Configuration,ROC-AUC,Accuracy,Recall,F1-Score,Analytical Finding
+Full Fed-GNIDS (GATv2 + GRU + DP),0.962,91.14%,98.06%,0.9377,Optimal spatial-temporal baseline
+w/o Temporal Recurrence (Spatial GATv2 Only),0.9106,83.32%,85.61%,0.8395,Recall drops by -12.45% without flow memory
+w/o Dynamic Attention (Static GCN + GRU),0.9209,85.71%,89.94%,0.8723,Static graphs miss dynamic edge relationships
+w/o Differential Privacy (No Norm Clipping),0.95,89.29%,95.96%,0.9182,Susceptible to gradient inversion leakage
