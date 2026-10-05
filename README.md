@@ -45,7 +45,7 @@ To counter adversarial manipulation in untrusted federated environments, the orc
        |            Central Aggregator: ACS Defense Engine           |
        |  Coordinate-wise Median Consensus & Directional Alignment   |
        +-------------------------------------------------------------+
-
+```
 
 --- ## Empirical Benchmark Results (UNSW-NB15) 
 Evaluated on the authentic **UNSW-NB15** benchmark across 24,000 independent testing flows (7,690 normal flows and 16,310 real attack incursions) partitioned under non-IID conditions.
