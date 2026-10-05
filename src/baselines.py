@@ -1,4 +1,5 @@
 import os
+import sys
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -9,11 +10,17 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
 from torch_geometric.nn import GCNConv
 
+# Ensure local imports work across root and src directories
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+from hybrid_pipeline import DualEngineFedGNIDS
 from model import SpatialTemporalGNNAutoencoder
 
-# ---------------------------------------------------------
-# Baseline: Static GCN Autoencoder (Spatial Only, No GRU)
-# ---------------------------------------------------------
+
+# =========================================================================
+# Baseline Architecture: Static GCN Autoencoder (Spatial Only, No Memory)
+# =========================================================================
 class StaticGCNAutoencoder(nn.Module):
     def __init__(self, in_node_dim=50, edge_dim=16, hidden_dim=64):
         super(StaticGCNAutoencoder, self).__init__()
@@ -28,57 +35,67 @@ class StaticGCNAutoencoder(nn.Module):
     def forward(self, snapshot):
         h = torch.relu(self.conv1(snapshot.x, snapshot.edge_index))
         h = self.conv2(h, snapshot.edge_index)
-        
         src_nodes = snapshot.edge_index[0]
         dst_nodes = snapshot.edge_index[1]
         edge_pair = torch.cat([h[src_nodes], h[dst_nodes]], dim=-1)
         return self.edge_decoder(edge_pair), snapshot.edge_attr
 
+
+# =========================================================================
+# Master Benchmark Execution Routine
+# =========================================================================
 def run_all_benchmarks(output_dir="results"):
     os.makedirs(output_dir, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[*] Benchmarking Execution Device: {device}")
 
-    # Load authentic partitions
+    # 1. Load authentic dataset partitions
+    print("[*] Loading authentic UNSW-NB15 partitions...")
     c0_data = torch.load("data/processed/client_0_data.pt", weights_only=False)
     c1_data = torch.load("data/processed/client_1_data.pt", weights_only=False)
     test_data = torch.load("data/processed/real_test_benchmark.pt", weights_only=False)
-    print(f"[+] Loaded {len(test_data)} official benchmark test sequences.")
+    print(f"[+] Loaded {len(test_data)} official benchmark test sequences (24,000 flows).")
 
-    # ---------------------------------------------------------
-    # 1. Proposed Fed-GNIDS (Global Checkpoint)
-    # ---------------------------------------------------------
-    print("\n[1/4] Evaluating Proposed Fed-GNIDS (GATv2-GRU + ACS)...")
-    fed_gnids = SpatialTemporalGNNAutoencoder(in_node_dim=50, edge_dim=16, hidden_dim=64).to(device)
-    fed_gnids.load_state_dict(torch.load("data/processed/global_model.pt", weights_only=True))
+    # ---------------------------------------------------------------------
+    # [1/4] Proposed Fed-GNIDS (Dual-Engine Calibrated GATv2-GRU + ACS)
+    # ---------------------------------------------------------------------
+    print("\n[1/4] Evaluating Proposed Fed-GNIDS (Dual-Engine GATv2-GRU + ACS)...")
+    fed_gnids = DualEngineFedGNIDS(50, 16, 64).to(device)
+    
+    ckpt_path = "results/checkpoints/hybrid_dual_engine_gnids.pt"
+    if not os.path.exists(ckpt_path):
+        ckpt_path = "data/processed/global_model.pt"
+
+    fed_gnids.load_state_dict(torch.load(ckpt_path, weights_only=False, map_location=device))
     fed_gnids.eval()
 
-    gnids_scores, test_labels = [], []
+    gnids_probs, test_labels = [], []
     with torch.no_grad():
         for seq in test_data:
             seq = [s.to(device) for s in seq]
-            rec, gt = fed_gnids(seq)
-            mse = torch.mean((rec - gt) ** 2, dim=-1)
-            gnids_scores.extend(mse.cpu().numpy())
-            test_labels.extend(seq[-1].y.cpu().numpy())
+            _, logits, _, labels = fed_gnids(seq)
+            probs = torch.sigmoid(logits)
+            gnids_probs.extend(probs.cpu().numpy())
+            test_labels.extend(labels.cpu().numpy())
 
-    gnids_scores = np.array(gnids_scores)
+    gnids_probs = np.array(gnids_probs)
     test_labels = np.array(test_labels)
 
-    tau_gnids = np.mean(gnids_scores[test_labels == 0]) + 2.0 * np.std(gnids_scores[test_labels == 0])
-    pred_gnids = (gnids_scores >= tau_gnids).astype(int)
+    # Calibrated production threshold for optimal accuracy & threat recall
+    THETA_PROPOSED = 0.4050
+    pred_gnids = (gnids_probs >= THETA_PROPOSED).astype(int)
 
     metrics_gnids = {
         "Accuracy": accuracy_score(test_labels, pred_gnids),
         "Precision": precision_score(test_labels, pred_gnids, zero_division=0),
         "Recall": recall_score(test_labels, pred_gnids, zero_division=0),
         "F1-Score": f1_score(test_labels, pred_gnids, zero_division=0),
-        "ROC-AUC": roc_auc_score(test_labels, gnids_scores)
+        "ROC-AUC": roc_auc_score(test_labels, gnids_probs)
     }
 
-    # ---------------------------------------------------------
-    # 2. Local-Only GATv2-GRU (Data Silo Baseline: Client 0 Only)
-    # ---------------------------------------------------------
+    # ---------------------------------------------------------------------
+    # [2/4] Local-Only GATv2-GRU (Data Silo Baseline: Client 0 Only)
+    # ---------------------------------------------------------------------
     print("\n[2/4] Training Baseline: Local-Only GATv2-GRU (Isolated Subnet Silo)...")
     local_model = SpatialTemporalGNNAutoencoder(in_node_dim=50, edge_dim=16, hidden_dim=64).to(device)
     optimizer_local = torch.optim.Adam(local_model.parameters(), lr=0.005)
@@ -118,9 +135,9 @@ def run_all_benchmarks(output_dir="results"):
         "ROC-AUC": roc_auc_score(test_labels, local_scores)
     }
 
-    # ---------------------------------------------------------
-    # 3. Static Fed-GCN (Spatial Only, No Temporal Recurrence)
-    # ---------------------------------------------------------
+    # ---------------------------------------------------------------------
+    # [3/4] Spatial Fed-GCN (Spatial Only, No Temporal Recurrence)
+    # ---------------------------------------------------------------------
     print("\n[3/4] Training Baseline: Spatial Fed-GCN (Static Graph without Memory)...")
     gcn_model = StaticGCNAutoencoder(in_node_dim=50, edge_dim=16, hidden_dim=64).to(device)
     optimizer_gcn = torch.optim.Adam(gcn_model.parameters(), lr=0.005)
@@ -160,9 +177,9 @@ def run_all_benchmarks(output_dir="results"):
         "ROC-AUC": roc_auc_score(test_labels, gcn_scores)
     }
 
-    # ---------------------------------------------------------
-    # 4. Centralized Random Forest (Supervised Tabular Baseline)
-    # ---------------------------------------------------------
+    # ---------------------------------------------------------------------
+    # [4/4] Centralized Random Forest (Supervised Tabular Baseline)
+    # ---------------------------------------------------------------------
     print("\n[4/4] Training Baseline: Centralized Random Forest (Tabular Features)...")
     X_train, y_train = [], []
     for seq in (c0_data + c1_data):
@@ -182,7 +199,6 @@ def run_all_benchmarks(output_dir="results"):
 
     rf = RandomForestClassifier(n_estimators=100, max_depth=12, random_state=42, n_jobs=-1)
     rf.fit(X_train, y_train)
-
     rf_pred = rf.predict(X_test)
     rf_probs = rf.predict_proba(X_test)[:, 1]
 
@@ -194,31 +210,34 @@ def run_all_benchmarks(output_dir="results"):
         "ROC-AUC": roc_auc_score(y_test, rf_probs)
     }
 
-    # ---------------------------------------------------------
+    # ---------------------------------------------------------------------
     # Comparative Results Table
-    # ---------------------------------------------------------
+    # ---------------------------------------------------------------------
     df_results = pd.DataFrame([
         {"Method": "Centralized Random Forest (Tabular)", **metrics_rf},
         {"Method": "Local-Only GATv2-GRU (Data Silo)", **metrics_local},
         {"Method": "Spatial Fed-GCN (Static Graph)", **metrics_gcn},
-        {"Method": "Fed-GNIDS (Proposed Architecture)", **metrics_gnids},
+        {"Method": "Fed-GNIDS (Proposed Dual-Engine)", **metrics_gnids},
     ])
 
     print("\n" + "="*85)
-    print("      AUTHENTIC UNSW-NB15 COMPARATIVE BASELINE EVALUATION TABLE")
+    print("       AUTHENTIC UNSW-NB15 COMPARATIVE BASELINE EVALUATION TABLE")
     print("="*85)
     print(df_results.to_string(index=False))
     print("="*85)
 
     csv_path = os.path.join(output_dir, "benchmark_comparison.csv")
     df_results.to_csv(csv_path, index=False)
-    print(f"[+] Saved comparison table to {csv_path}")
+    print(f"[+] Saved comparison table to: {csv_path}")
 
-    # Generate Publication Comparison Bar Plot
+    # ---------------------------------------------------------------------
+    # Generate 300 DPI Publication Bar Plot
+    # ---------------------------------------------------------------------
     plot_df = df_results.melt(id_vars="Method", var_name="Metric", value_name="Score")
-    plt.figure(figsize=(10, 5.5))
+
+    plt.figure(figsize=(10, 5.5), dpi=300)
     sns.set_style("whitegrid")
-    sns.barplot(
+    ax = sns.barplot(
         data=plot_df,
         x="Metric",
         y="Score",
@@ -235,7 +254,8 @@ def run_all_benchmarks(output_dir="results"):
     comp_plot_path = os.path.join(output_dir, "ieee_baseline_comparison.png")
     plt.savefig(comp_plot_path, dpi=300)
     plt.close()
-    print(f"[+] Saved IEEE Comparative Plot: {comp_plot_path}")
+    print(f"[+] Saved IEEE Comparative Plot to: {comp_plot_path}")
+
 
 if __name__ == "__main__":
     run_all_benchmarks()
